@@ -11,8 +11,15 @@ from mediapipe.tasks.python.core.base_options import BaseOptions
 from ultralytics import YOLO
 
 from config import (
+    CLEAR_CANVAS_FRAMES,
+    CURSOR_SMOOTHING_ALPHA,
+    DRAW_DISABLE_FRAMES,
+    DRAW_ENABLE_FRAMES,
+    FINGER_EXTENDED_ANGLE,
+    FINGER_FOLDED_ANGLE,
     FRAME_QUEUE_SIZE,
     HAND_LANDMARKER_PATH,
+    HAND_LOST_FRAME_TOLERANCE,
     HAND_MIN_DETECTION_CONFIDENCE,
     HAND_MIN_PRESENCE_CONFIDENCE,
     HAND_MIN_TRACKING_CONFIDENCE,
@@ -120,6 +127,12 @@ class GestureCalculator:
         self.canvas = None
         self.prev_x, self.prev_y = 0, 0
         self.cursor_pos = None
+        self.smoothed_cursor = None
+        self.lost_frames = 0
+        self.draw_enable_count = 0
+        self.draw_disable_count = 0
+        self.clear_count = 0
+        self.is_drawing = False
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.start_time = time.monotonic()
@@ -154,47 +167,130 @@ class GestureCalculator:
         timestamp_ms = self._next_timestamp_ms()
         results = self.hands.detect_for_video(mp_image, timestamp_ms)
 
-        cursor = None
         if results.hand_landmarks:
-            for landmarks in results.hand_landmarks:
-                cursor = self._handle_landmarks(frame, landmarks)
-
-        with self.lock:
-            self.cursor_pos = cursor
+            self._handle_landmarks(frame, results.hand_landmarks[0])
+        else:
+            self._handle_missing_hand()
 
     def _handle_landmarks(self, frame, landmarks):
         height, width, _ = frame.shape
-        wrist = landmarks[0]
+        raw_cursor = (int(landmarks[8].x * width), int(landmarks[8].y * height))
 
-        index_up = self._get_dist(landmarks[8], wrist) > self._get_dist(landmarks[6], wrist)
-        middle_down = self._get_dist(landmarks[12], wrist) < self._get_dist(landmarks[10], wrist)
-        ring_down = self._get_dist(landmarks[16], wrist) < self._get_dist(landmarks[14], wrist)
-        pinky_down = self._get_dist(landmarks[20], wrist) < self._get_dist(landmarks[18], wrist)
+        index_extended, index_folded = self._finger_state(landmarks, 5, 6, 7, 8)
+        _, middle_folded = self._finger_state(landmarks, 9, 10, 11, 12)
+        _, ring_folded = self._finger_state(landmarks, 13, 14, 15, 16)
+        _, pinky_folded = self._finger_state(landmarks, 17, 18, 19, 20)
 
-        is_drawing = index_up and middle_down and ring_down and pinky_down
-        is_fist = not index_up and middle_down and ring_down and pinky_down
-
-        x, y = int(landmarks[8].x * width), int(landmarks[8].y * height)
+        drawing_candidate = index_extended and middle_folded and ring_folded and pinky_folded
+        fist_candidate = index_folded and middle_folded and ring_folded and pinky_folded
 
         with self.lock:
-            if is_drawing:
+            self.lost_frames = 0
+            cursor = self._smooth_cursor(raw_cursor)
+            self._update_drawing_state(drawing_candidate)
+            self._update_clear_state(frame, fist_candidate)
+
+            if self.is_drawing and not fist_candidate:
                 if self.prev_x == 0 and self.prev_y == 0:
-                    self.prev_x, self.prev_y = x, y
+                    self.prev_x, self.prev_y = cursor
                 cv2.line(
                     self.canvas,
                     (self.prev_x, self.prev_y),
-                    (x, y),
+                    cursor,
                     (255, 255, 255),
                     10,
                 )
-                self.prev_x, self.prev_y = x, y
+                self.prev_x, self.prev_y = cursor
             else:
-                self.prev_x, self.prev_y = 0, 0
+                if not self.is_drawing:
+                    self.prev_x, self.prev_y = 0, 0
 
-            if is_fist:
-                self.canvas = np.zeros_like(frame)
+            self.cursor_pos = cursor
 
-        return x, y
+    def _handle_missing_hand(self):
+        with self.lock:
+            self.lost_frames += 1
+            if self.lost_frames <= HAND_LOST_FRAME_TOLERANCE:
+                return
+
+            self.cursor_pos = None
+            self.smoothed_cursor = None
+            self.prev_x, self.prev_y = 0, 0
+            self.draw_enable_count = 0
+            self.draw_disable_count = 0
+            self.clear_count = 0
+            self.is_drawing = False
+
+    def _smooth_cursor(self, raw_cursor):
+            import math
+            if self.smoothed_cursor is None:
+                self.smoothed_cursor = (float(raw_cursor[0]), float(raw_cursor[1]))
+                return int(raw_cursor[0]), int(raw_cursor[1])
+
+            prev_x, prev_y = self.smoothed_cursor
+            raw_x, raw_y = raw_cursor
+
+            # Считаем "скорость" движения пальца (расстояние в пикселях между кадрами)
+            distance = math.hypot(raw_x - prev_x, raw_y - prev_y)
+
+            # Умный коэффициент альфа:
+            # Медленно двигаем (<10px) = 0.2 (очень плавная линия)
+            # Резко двигаем (>100px) = стремится к 0.9 (моментальный отклик без отставания)
+            dynamic_alpha = min(0.9, max(0.2, distance / 100.0))
+
+            self.smoothed_cursor = (
+                dynamic_alpha * raw_x + (1 - dynamic_alpha) * prev_x,
+                dynamic_alpha * raw_y + (1 - dynamic_alpha) * prev_y,
+            )
+
+            return int(self.smoothed_cursor[0]), int(self.smoothed_cursor[1])
+
+    def _update_drawing_state(self, drawing_candidate):
+        if drawing_candidate:
+            self.draw_enable_count += 1
+            self.draw_disable_count = 0
+        else:
+            self.draw_disable_count += 1
+            self.draw_enable_count = 0
+
+        if self.draw_enable_count >= DRAW_ENABLE_FRAMES:
+            self.is_drawing = True
+        elif self.draw_disable_count >= DRAW_DISABLE_FRAMES:
+            self.is_drawing = False
+
+    def _update_clear_state(self, frame, fist_candidate):
+        if not fist_candidate:
+            self.clear_count = 0
+            return
+
+        self.clear_count += 1
+        self.is_drawing = False
+        self.prev_x, self.prev_y = 0, 0
+
+        if self.clear_count >= CLEAR_CANVAS_FRAMES:
+            self.canvas = np.zeros_like(frame)
+
+    @classmethod
+    def _finger_state(cls, landmarks, mcp_id, pip_id, dip_id, tip_id):
+        pip_angle = cls._angle(landmarks[mcp_id], landmarks[pip_id], landmarks[dip_id])
+        dip_angle = cls._angle(landmarks[pip_id], landmarks[dip_id], landmarks[tip_id])
+
+        extended = pip_angle >= FINGER_EXTENDED_ANGLE and dip_angle >= FINGER_EXTENDED_ANGLE - 10
+        folded = pip_angle <= FINGER_FOLDED_ANGLE or dip_angle <= FINGER_FOLDED_ANGLE - 5
+        return bool(extended), bool(folded)
+
+    @staticmethod
+    def _angle(a, b, c):
+        vector_ab = np.array([a.x - b.x, a.y - b.y, a.z - b.z])
+        vector_cb = np.array([c.x - b.x, c.y - b.y, c.z - b.z])
+        norm_ab = np.linalg.norm(vector_ab)
+        norm_cb = np.linalg.norm(vector_cb)
+
+        if norm_ab == 0 or norm_cb == 0:
+            return 0
+
+        cosine = np.dot(vector_ab, vector_cb) / (norm_ab * norm_cb)
+        return np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
 
     def _next_timestamp_ms(self):
         timestamp_ms = int((time.monotonic() - self.start_time) * 1000)
@@ -202,10 +298,6 @@ class GestureCalculator:
             timestamp_ms = self.last_timestamp_ms + 1
         self.last_timestamp_ms = timestamp_ms
         return timestamp_ms
-
-    @staticmethod
-    def _get_dist(p1, p2):
-        return ((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2) ** 0.5
 
     def update_frame(self, frame):
         put_latest(self.frame_queue, frame)
