@@ -14,43 +14,30 @@
 ├── main.py              # Точка входа, главный цикл приложения и UI
 ├── camera.py            # Поточное чтение кадров с камеры
 ├── cv_models.py         # YOLO-детектор и обработчик жестов
-├── .gitignore           # Исключения для Git
-├── yolo11s.pt           # Локальная YOLO-модель, не хранится в Git
-├── yolo11s.onnx         # ONNX-версия модели, генерируется локально
-├── yolov8n.pt           # Дополнительная локальная модель
-├── hand_landmarker.task # Локальная модель MediaPipe
-└── cv_system.log        # Лог выполнения, не хранится в Git
+├── requirements.txt     # Python-зависимости проекта
+├── README.md            # Документация проекта
+└── .gitignore           # Исключения для Git
 ```
 
 ## Требования
 
-Нужен Python и доступная веб-камера. Основные Python-зависимости:
+Нужен Python и доступная веб-камера. Python-зависимости зафиксированы в `requirements.txt`.
 
-```text
-opencv-python
-numpy
-ultralytics
-mediapipe
-```
+Ключевые библиотеки проекта:
+
+- `opencv-python` / `opencv-contrib-python` - работа с камерой и кадрами;
+- `ultralytics` - YOLO-детекция объектов;
+- `mediapipe` - распознавание руки и жестов;
+- `numpy` - обработка массивов изображений;
+- `onnx`, `onnxruntime` - ONNX-модель и инференс;
+- `torch`, `torchvision` - зависимости YOLO/Ultralytics.
 
 Если используется виртуальное окружение:
 
 ```powershell
 .\.venv\Scripts\activate
-pip install opencv-python numpy ultralytics mediapipe
+pip install -r requirements.txt
 ```
-
-## Локальные модели
-
-Модели не добавляются в Git, потому что это большие бинарные файлы и локальные артефакты.
-
-Ожидаемые файлы в корне проекта:
-
-- `yolo11s.pt` - исходная YOLO-модель;
-- `yolo11s.onnx` - ONNX-модель для инференса;
-- `hand_landmarker.task` - модель MediaPipe для распознавания руки.
-
-Если `yolo11s.onnx` отсутствует, приложение попробует создать его из `yolo11s.pt`.
 
 ## Запуск
 
@@ -85,9 +72,7 @@ python main.py
 
 ## Логи и Git
 
-Файл `cv_system.log` создается при запуске приложения и исключен из Git.
-
-Также исключены:
+Через `.gitignore` исключены локальные файлы, которые не должны попадать в репозиторий:
 
 - виртуальные окружения: `.venv/`, `venv/`, `env/`;
 - Python-кэш: `__pycache__/`, `*.pyc`;
@@ -103,7 +88,7 @@ python main.py
 
 ### MediaPipe: `module 'mediapipe' has no attribute 'solutions'`
 
-В новых версиях MediaPipe старый API `mp.solutions` может быть недоступен. Для таких версий нужно использовать MediaPipe Tasks API и локальный файл `hand_landmarker.task`.
+В новых версиях MediaPipe старый API `mp.solutions` может быть недоступен. Если возникает такая ошибка, нужно привести код обработки жестов к установленной версии MediaPipe.
 
 ### Git: `detected dubious ownership`
 
