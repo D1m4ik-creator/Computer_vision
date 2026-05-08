@@ -1,169 +1,221 @@
-import os
-import cv2
-import numpy as np
-import mediapipe as mp
-import threading
 import logging
+import threading
 import time
-from pathlib import Path
+from queue import Empty, Full, Queue
+
+import cv2
+import mediapipe as mp
+import numpy as np
 from mediapipe.tasks.python import vision
 from mediapipe.tasks.python.core.base_options import BaseOptions
 from ultralytics import YOLO
 
+from config import (
+    FRAME_QUEUE_SIZE,
+    HAND_LANDMARKER_PATH,
+    HAND_MIN_DETECTION_CONFIDENCE,
+    HAND_MIN_PRESENCE_CONFIDENCE,
+    HAND_MIN_TRACKING_CONFIDENCE,
+    HAND_NUM_HANDS,
+    YOLO_CONFIDENCE,
+    YOLO_IMAGE_SIZE,
+    YOLO_ONNX_PATH,
+    YOLO_PT_PATH,
+)
+
 logger = logging.getLogger("CV_Core")
+
+
+def put_latest(frame_queue, frame):
+    frame_copy = frame.copy()
+    try:
+        frame_queue.put_nowait(frame_copy)
+        return
+    except Full:
+        pass
+
+    try:
+        frame_queue.get_nowait()
+    except Empty:
+        pass
+
+    try:
+        frame_queue.put_nowait(frame_copy)
+    except Full:
+        pass
+
 
 class YOLODetector:
     def __init__(self):
-        model_name = 'yolo11s' 
-        pt_path = f"{model_name}.pt"
-        onnx_path = f"{model_name}.onnx"
-
-        if not os.path.exists(onnx_path):
+        if not YOLO_ONNX_PATH.exists():
             logger.info("Конвертация в ONNX...")
-            temp_model = YOLO(pt_path)
-            temp_model.export(format='onnx', imgsz=640)
+            temp_model = YOLO(str(YOLO_PT_PATH))
+            temp_model.export(format="onnx", imgsz=YOLO_IMAGE_SIZE)
 
-        self.model = YOLO(onnx_path, task='detect') 
-        
-        # Многопоточные переменные для YOLO
+        self.model = YOLO(str(YOLO_ONNX_PATH), task="detect")
+        self.frame_queue = Queue(maxsize=FRAME_QUEUE_SIZE)
         self.latest_boxes = []
-        self.frame_to_process = None
         self.lock = threading.Lock()
-        self.stopped = False
-        
-        # Запуск фонового потока инференса
-        self.thread = threading.Thread(target=self._worker)
-        self.thread.daemon = True
+        self.stop_event = threading.Event()
+
+        self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
         logger.info("YOLO Thread запущен.")
 
     def _worker(self):
-        while not self.stopped:
-            frame = None
-            # Безопасно забираем кадр для обработки
-            with self.lock:
-                if self.frame_to_process is not None:
-                    frame = self.frame_to_process.copy()
-                    self.frame_to_process = None 
-            
-            if frame is not None:
-                # stream=False лучше для одиночных кадров в фоне
-                results = self.model(frame, verbose=False, conf=0.5, imgsz=640)
-                
+        while not self.stop_event.is_set():
+            try:
+                frame = self.frame_queue.get(timeout=0.05)
+            except Empty:
+                continue
+
+            try:
+                results = self.model(
+                    frame,
+                    verbose=False,
+                    conf=YOLO_CONFIDENCE,
+                    imgsz=YOLO_IMAGE_SIZE,
+                )
+
                 boxes_data = []
-                for r in results:
-                    for box in r.boxes:
+                for result in results:
+                    for box in result.boxes:
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
                         conf = float(box.conf[0])
                         cls_name = self.model.names[int(box.cls[0])]
                         boxes_data.append((x1, y1, x2, y2, conf, cls_name))
-                
-                # Безопасно обновляем список рамок
+
                 with self.lock:
                     self.latest_boxes = boxes_data
+            except Exception:
+                logger.exception("Ошибка YOLO inference")
 
     def update_frame(self, frame):
-        # Отдаем кадр рабочему потоку
-        with self.lock:
-            self.frame_to_process = frame
-            
+        put_latest(self.frame_queue, frame)
+
     def get_boxes(self):
-        # Получаем последние вычисленные рамки
         with self.lock:
-            return self.latest_boxes
-            
+            return list(self.latest_boxes)
+
     def stop(self):
-        self.stopped = True
-        self.thread.join()
+        self.stop_event.set()
+        self.thread.join(timeout=2)
+
 
 class GestureCalculator:
     def __init__(self):
-        self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=False, max_num_hands=1,
-            min_detection_confidence=0.6, min_tracking_confidence=0.6
+        if not HAND_LANDMARKER_PATH.exists():
+            raise FileNotFoundError(f"MediaPipe model not found: {HAND_LANDMARKER_PATH}")
+
+        options = vision.HandLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=str(HAND_LANDMARKER_PATH)),
+            running_mode=vision.RunningMode.VIDEO,
+            num_hands=HAND_NUM_HANDS,
+            min_hand_detection_confidence=HAND_MIN_DETECTION_CONFIDENCE,
+            min_hand_presence_confidence=HAND_MIN_PRESENCE_CONFIDENCE,
+            min_tracking_confidence=HAND_MIN_TRACKING_CONFIDENCE,
         )
+        self.hands = vision.HandLandmarker.create_from_options(options)
+        self.frame_queue = Queue(maxsize=FRAME_QUEUE_SIZE)
         self.canvas = None
         self.prev_x, self.prev_y = 0, 0
-        
-        # Многопоточные переменные
-        self.frame_to_process = None
-        self.cursor_pos = None  
+        self.cursor_pos = None
         self.lock = threading.Lock()
-        self.stopped = False
-        
-        # Запускаем MediaPipe в фоне!
-        self.thread = threading.Thread(target=self._worker)
-        self.thread.daemon = True
+        self.stop_event = threading.Event()
+        self.start_time = time.monotonic()
+        self.last_timestamp_ms = -1
+
+        self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
+        logger.info("MediaPipe Thread запущен.")
 
     def _worker(self):
-        import math
-        
-        def get_dist(p1, p2):
-            # Вычисляет расстояние между двумя точками
-            return math.hypot(p1.x - p2.x, p1.y - p2.y)
+        while not self.stop_event.is_set():
+            try:
+                frame = self.frame_queue.get(timeout=0.05)
+            except Empty:
+                continue
 
-        while not self.stopped:
-            frame = None
-            with self.lock:
-                if self.frame_to_process is not None:
-                    frame = self.frame_to_process.copy()
-                    self.frame_to_process = None
-            
-            if frame is not None:
-                if self.canvas is None:
-                    self.canvas = np.zeros_like(frame)
+            try:
+                self._process_frame(frame)
+            except Exception:
+                logger.exception("Ошибка MediaPipe inference")
 
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = self.hands.process(rgb_frame)
+    def _process_frame(self, frame):
+        with self.lock:
+            if self.canvas is None:
+                self.canvas = np.zeros_like(frame)
 
-                cursor = None
-                if results.multi_hand_landmarks:
-                    for hand_landmarks in results.multi_hand_landmarks:
-                        lm = hand_landmarks.landmark
-                        h, w, c = frame.shape
-                        
-                        # Новая логика: независима от наклона руки
-                        # Палец выпрямлен, если кончик дальше от запястья (0), чем сустав (PIP)
-                        wrist = lm[0]
-                        index_up = get_dist(lm[8], wrist) > get_dist(lm[6], wrist)
-                        middle_down = get_dist(lm[12], wrist) < get_dist(lm[10], wrist)
-                        ring_down = get_dist(lm[16], wrist) < get_dist(lm[14], wrist)
-                        pinky_down = get_dist(lm[20], wrist) < get_dist(lm[18], wrist)
-                        
-                        is_drawing = index_up and middle_down and ring_down and pinky_down
-                        is_fist = not index_up and middle_down and ring_down and pinky_down
-                        
-                        x, y = int(lm[8].x * w), int(lm[8].y * h)
-                        cursor = (x, y)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(
+            image_format=mp.ImageFormat.SRGB,
+            data=np.ascontiguousarray(rgb_frame),
+        )
+        timestamp_ms = self._next_timestamp_ms()
+        results = self.hands.detect_for_video(mp_image, timestamp_ms)
 
-                        # Обновляем холст безопасно
-                        with self.lock:
-                            if is_drawing:
-                                if self.prev_x == 0 and self.prev_y == 0:
-                                    self.prev_x, self.prev_y = x, y
-                                cv2.line(self.canvas, (self.prev_x, self.prev_y), (x, y), (255, 255, 255), 10)
-                                self.prev_x, self.prev_y = x, y
-                            else:
-                                self.prev_x, self.prev_y = 0, 0
-                                
-                            if is_fist:
-                                self.canvas = np.zeros_like(frame)
-                                
-                with self.lock:
-                    self.cursor_pos = cursor
+        cursor = None
+        if results.hand_landmarks:
+            for landmarks in results.hand_landmarks:
+                cursor = self._handle_landmarks(frame, landmarks)
+
+        with self.lock:
+            self.cursor_pos = cursor
+
+    def _handle_landmarks(self, frame, landmarks):
+        height, width, _ = frame.shape
+        wrist = landmarks[0]
+
+        index_up = self._get_dist(landmarks[8], wrist) > self._get_dist(landmarks[6], wrist)
+        middle_down = self._get_dist(landmarks[12], wrist) < self._get_dist(landmarks[10], wrist)
+        ring_down = self._get_dist(landmarks[16], wrist) < self._get_dist(landmarks[14], wrist)
+        pinky_down = self._get_dist(landmarks[20], wrist) < self._get_dist(landmarks[18], wrist)
+
+        is_drawing = index_up and middle_down and ring_down and pinky_down
+        is_fist = not index_up and middle_down and ring_down and pinky_down
+
+        x, y = int(landmarks[8].x * width), int(landmarks[8].y * height)
+
+        with self.lock:
+            if is_drawing:
+                if self.prev_x == 0 and self.prev_y == 0:
+                    self.prev_x, self.prev_y = x, y
+                cv2.line(
+                    self.canvas,
+                    (self.prev_x, self.prev_y),
+                    (x, y),
+                    (255, 255, 255),
+                    10,
+                )
+                self.prev_x, self.prev_y = x, y
+            else:
+                self.prev_x, self.prev_y = 0, 0
+
+            if is_fist:
+                self.canvas = np.zeros_like(frame)
+
+        return x, y
+
+    def _next_timestamp_ms(self):
+        timestamp_ms = int((time.monotonic() - self.start_time) * 1000)
+        if timestamp_ms <= self.last_timestamp_ms:
+            timestamp_ms = self.last_timestamp_ms + 1
+        self.last_timestamp_ms = timestamp_ms
+        return timestamp_ms
+
+    @staticmethod
+    def _get_dist(p1, p2):
+        return ((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2) ** 0.5
 
     def update_frame(self, frame):
-        # Передаем кадр рабочему потоку
-        with self.lock:
-            self.frame_to_process = frame
+        put_latest(self.frame_queue, frame)
 
     def get_render_data(self):
-        # Отдаем холст и курсор для отрисовки в главном потоке
         with self.lock:
-            return (self.canvas.copy() if self.canvas is not None else None), self.cursor_pos
+            canvas = self.canvas.copy() if self.canvas is not None else None
+            return canvas, self.cursor_pos
 
     def stop(self):
-        self.stopped = True
-        self.thread.join()
+        self.stop_event.set()
+        self.thread.join(timeout=2)
+        self.hands.close()

@@ -13,6 +13,7 @@
 .
 ├── main.py              # Точка входа, главный цикл приложения и UI
 ├── camera.py            # Поточное чтение кадров с камеры
+├── config.py            # Настройки камеры, моделей и порогов
 ├── cv_models.py         # YOLO-детектор и обработчик жестов
 ├── requirements.txt     # Python-зависимости проекта
 ├── README.md            # Документация проекта
@@ -52,6 +53,16 @@ pip install -r requirements.txt
 ```powershell
 python main.py
 ```
+
+## Конфигурация
+
+Основные параметры вынесены в `config.py`:
+
+- источник и размер кадра камеры;
+- имя и пути YOLO-модели;
+- confidence и image size для YOLO;
+- путь и пороги MediaPipe Hand Landmarker;
+- размер очереди кадров для фоновой обработки.
 
 ## Управление
 

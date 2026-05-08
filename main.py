@@ -4,6 +4,7 @@ import time
 
 # Импорты из наших модулей
 from camera import ThreadedCamera
+from config import CAMERA_HEIGHT, CAMERA_SRC, CAMERA_WIDTH
 from cv_models import YOLODetector, GestureCalculator
 
 logging.basicConfig(
@@ -19,7 +20,7 @@ class CVSystem:
         logger.info("Инициализация компонентов...")
         
         # Подключаем модули
-        self.camera = ThreadedCamera(src=0)
+        self.camera = ThreadedCamera(src=CAMERA_SRC, width=CAMERA_WIDTH, height=CAMERA_HEIGHT)
         self.yolo = YOLODetector()
         self.calculator = GestureCalculator()
         
@@ -28,47 +29,48 @@ class CVSystem:
     def run(self):
         logger.info("Главный цикл запущен.")
 
-        while True:
-            ret, frame = self.camera.read()
-            if not ret or frame is None:
-                continue
+        try:
+            while True:
+                ret, frame = self.camera.read()
+                if not ret or frame is None:
+                    continue
 
-            frame = cv2.flip(frame, 1)
+                frame = cv2.flip(frame, 1)
 
-            if self.mode == 1:
-                self.yolo.update_frame(frame)
-                boxes = self.yolo.get_boxes()
-                self.draw_yolo_boxes(frame, boxes)
-            else:
-                # Отдаем кадр в фон
-                self.calculator.update_frame(frame)
-                
-                # Забираем слои для отрисовки
-                canvas, cursor = self.calculator.get_render_data()
-                
-                if canvas is not None:
-                    # Супербыстрое наложение холста (O(1) вместо сложной маскировки)
-                    frame = cv2.add(frame, canvas)
-                
-                if cursor is not None:
-                    # Рисуем кружок-курсор на кончике пальца
-                    cv2.circle(frame, cursor, 8, (0, 255, 255), cv2.FILLED)
+                if self.mode == 1:
+                    self.yolo.update_frame(frame)
+                    boxes = self.yolo.get_boxes()
+                    self.draw_yolo_boxes(frame, boxes)
+                else:
+                    # Отдаем кадр в фон
+                    self.calculator.update_frame(frame)
 
-            # Подсчет FPS
-            curr_time = time.time()
-            fps = 1 / (curr_time - self.prev_time)
-            self.prev_time = curr_time
+                    # Забираем слои для отрисовки
+                    canvas, cursor = self.calculator.get_render_data()
 
-            self.draw_ui(frame, fps)
-            cv2.imshow("CV System", frame)
+                    if canvas is not None:
+                        # Супербыстрое наложение холста (O(1) вместо сложной маскировки)
+                        frame = cv2.add(frame, canvas)
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == 9:  # Tab
-                self.mode = 2 if self.mode == 1 else 1
+                    if cursor is not None:
+                        # Рисуем кружок-курсор на кончике пальца
+                        cv2.circle(frame, cursor, 8, (0, 255, 255), cv2.FILLED)
 
-        self.cleanup()
+                # Подсчет FPS
+                curr_time = time.time()
+                fps = 1 / (curr_time - self.prev_time)
+                self.prev_time = curr_time
+
+                self.draw_ui(frame, fps)
+                cv2.imshow("CV System", frame)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+                elif key == 9:  # Tab
+                    self.mode = 2 if self.mode == 1 else 1
+        finally:
+            self.cleanup()
 
     def draw_yolo_boxes(self, frame, boxes):
         for (x1, y1, x2, y2, conf, cls_name) in boxes:

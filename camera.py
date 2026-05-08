@@ -13,6 +13,7 @@ class ThreadedCamera:
         # Читаем первый кадр
         self.ret, self.frame = self.cap.read()
         self.stopped = False
+        self.lock = threading.Lock()
         
         # Запускаем поток
         self.thread = threading.Thread(target=self.update, args=())
@@ -22,11 +23,16 @@ class ThreadedCamera:
     def update(self):
         # Бесконечный цикл чтения кадров в фоне
         while not self.stopped:
-            self.ret, self.frame = self.cap.read()
+            ret, frame = self.cap.read()
+            with self.lock:
+                self.ret = ret
+                self.frame = frame
 
     def read(self):
         # Отдаем самый свежий кадр
-        return self.ret, self.frame
+        with self.lock:
+            frame = self.frame.copy() if self.frame is not None else None
+            return self.ret, frame
 
     def stop(self):
         self.stopped = True
