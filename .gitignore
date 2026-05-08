@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs
+*.log
+logs/
+
+# Local ML models and generated inference artifacts
+*.pt
+*.onnx
+*.task
+*.engine
+*.tflite
+
+# Runtime/cache output
+.cache/
+runs/
+outputs/
+results/
+
+# IDE/editor local files
+.vscode/
+.idea/
